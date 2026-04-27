@@ -1,37 +1,12 @@
 #include <Arduino.h>
 #include <FlexCAN_T4.h>
 
-const uint8_t POT_1_PIN = A0;
-const uint8_t POT_2_PIN = A1;
-const uint8_t PWM_1_PIN = 2;
-const uint8_t PWM_2_PIN = 3;
-const uint8_t PWM_1_MEASURE_PIN = 4;
-const uint8_t PWM_2_MEASURE_PIN = 5;
-const uint8_t STATUS_LED_PIN = LED_BUILTIN;
-
-const uint32_t CAN_BAUD_RATE = 500000;
-const uint32_t CAN_CONTROL_ID = 0x600;
-const uint32_t PC_HEARTBEAT_ID = 0x610;
-const uint32_t TEENSY_HEARTBEAT_ID = 0x611;
-const uint8_t CAN_CMD_OFF = 0x00;
-const uint8_t CAN_CMD_ON = 0x01;
-const uint8_t CAN_CMD_TOGGLE = 0x02;
-const uint8_t HEARTBEAT_MAGIC = 0xA5;
-
-const float ADC_REFERENCE_VOLTAGE = 3.3f;
-const int ADC_RESOLUTION_BITS = 12;
-const int ADC_MAX_VALUE = (1 << ADC_RESOLUTION_BITS) - 1;
-const int PWM_RESOLUTION_BITS = 12;
-const int PWM_MAX_VALUE = (1 << PWM_RESOLUTION_BITS) - 1;
-const float PWM_FREQUENCY_HZ = 800.0f;
-
-const unsigned long SERIAL_BAUD_RATE = 115200;
-const unsigned long READ_INTERVAL_MS = 200;
-const uint32_t PULSE_TIMEOUT_US = 10000;
-const uint32_t CAN_WATCHDOG_TIMEOUT_US = 5000000;
-const uint32_t HEARTBEAT_TX_INTERVAL_US = 1000000;
-const int BAR_WIDTH = 30;
-const int WAVEFORM_WIDTH = 40;
+#include "adc_config.h"
+#include "can_config.h"
+#include "dashboard.h"
+#include "pins.h"
+#include "pwm_config.h"
+#include "system_config.h"
 
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
 volatile bool pwmEnabled = false;
@@ -52,12 +27,6 @@ struct PulseCapture {
   volatile uint32_t periodUs = 0;
   volatile bool hasMeasurement = false;
   volatile bool seenRise = false;
-};
-
-struct PulseMeasurement {
-  uint32_t highUs = 0;
-  uint32_t periodUs = 0;
-  bool valid = false;
 };
 
 PulseCapture pwm1Capture;
@@ -186,95 +155,71 @@ PulseMeasurement readPulseMeasurement(PulseCapture &capture) {
   return measurement;
 }
 
-void printBar(int value, int maxValue) {
-  const int filledWidth = (value * BAR_WIDTH + maxValue / 2) / maxValue;
-
-  Serial.print("[");
-  for (int i = 0; i < BAR_WIDTH; i++) {
-    Serial.print(i < filledWidth ? "#" : ".");
-  }
-  Serial.print("]");
+DashboardChannel buildChannel(const char *label,
+                              uint8_t pwmPin,
+                              uint8_t measurePin,
+                              int adcRaw,
+                              int pwmOutput,
+                              const PulseMeasurement &measurement) {
+  DashboardChannel ch{};
+  ch.label = label;
+  ch.pwmPin = pwmPin;
+  ch.measurePin = measurePin;
+  ch.adcRaw = adcRaw;
+  ch.adcMax = ADC_MAX_VALUE;
+  ch.voltage = adcRaw * ADC_REFERENCE_VOLTAGE / ADC_MAX_VALUE;
+  ch.pwmOutput = pwmOutput;
+  ch.pwmMax = PWM_MAX_VALUE;
+  ch.commandedDutyPercent = pwmOutput * 100.0f / PWM_MAX_VALUE;
+  ch.measurement = measurement;
+  ch.inputHigh = digitalRead(measurePin) == HIGH;
+  return ch;
 }
 
-void printSteadyWaveform(bool high) {
-  Serial.print(high ? "|" : " ");
-  for (int i = 0; i < WAVEFORM_WIDTH; i++) {
-    Serial.print(high ? "-" : "_");
-  }
-  Serial.print(high ? "|" : " ");
-}
+DashboardState buildDashboardState(int pot1Raw, int pot2Raw,
+                                   int pwm1OutputValue, int pwm2OutputValue,
+                                   const PulseMeasurement &m1,
+                                   const PulseMeasurement &m2) {
+  const uint32_t nowUs = micros();
+  DashboardState s{};
+  s.uptimeMs = millis();
+  s.pwmEnabled = pwmEnabled;
+  s.pwmFrequencyHz = PWM_FREQUENCY_HZ;
 
-void printPulseWaveform(const PulseMeasurement &measurement) {
-  int highWidth = (measurement.highUs * WAVEFORM_WIDTH + measurement.periodUs / 2) / measurement.periodUs;
-  highWidth = constrain(highWidth, 0, WAVEFORM_WIDTH);
+  s.ch1 = buildChannel("A0", PWM_1_PIN, PWM_1_MEASURE_PIN, pot1Raw, pwm1OutputValue, m1);
+  s.ch2 = buildChannel("A1", PWM_2_PIN, PWM_2_MEASURE_PIN, pot2Raw, pwm2OutputValue, m2);
 
-  Serial.print("|");
-  for (int i = 0; i < highWidth; i++) {
-    Serial.print("-");
-  }
-  Serial.print("|");
-  for (int i = highWidth; i < WAVEFORM_WIDTH; i++) {
-    Serial.print("_");
-  }
-}
+  s.canControlId = CAN_CONTROL_ID;
+  s.canBaudRate = CAN_BAUD_RATE;
+  s.pcHeartbeatId = PC_HEARTBEAT_ID;
+  s.teensyHeartbeatId = TEENSY_HEARTBEAT_ID;
+  s.heartbeatMagic = HEARTBEAT_MAGIC;
+  s.heartbeatTxIntervalMs = HEARTBEAT_TX_INTERVAL_US / 1000;
 
-void printChannelValue(const char *name, uint8_t pwmPin, int analogValue, int pwmValue) {
-  const float voltage = analogValue * ADC_REFERENCE_VOLTAGE / ADC_MAX_VALUE;
-  const float dutyPercent = pwmValue * 100.0f / PWM_MAX_VALUE;
+  s.lastCanCommandName = canCommandName(lastCanCommand);
+  s.hasReceivedCommand = canCommandCount > 0;
+  s.canCommandCount = canCommandCount;
+  s.canInvalidCommandCount = canInvalidCommandCount;
+  s.lastCanCommandAgeMs = canCommandCount > 0 ? (nowUs - lastCanCommandUs) / 1000 : 0;
 
-  Serial.printf("%-4s | PWM %2u | ADC %4d | %5.3f V | duty %6.2f %% | ",
-                name,
-                pwmPin,
-                analogValue,
-                voltage,
-                dutyPercent);
-  printBar(pwmValue, PWM_MAX_VALUE);
-  Serial.println();
-}
+  s.canWatchdogTriggered = canWatchdogTriggered;
+  s.canWatchdogTimeoutMs = CAN_WATCHDOG_TIMEOUT_US / 1000;
 
-void printMeasuredWaveform(const char *name, uint8_t inputPin, const PulseMeasurement &measurement) {
-  Serial.printf("%-4s pin %-2u : ", name, inputPin);
+  s.pcHeartbeatCount = pcHeartbeatCount;
+  s.teensyHeartbeatCount = teensyHeartbeatCount;
+  s.pcHeartbeatSeen = lastPcHeartbeatUs != 0;
+  s.lastPcHeartbeatAgeMs = s.pcHeartbeatSeen ? (nowUs - lastPcHeartbeatUs) / 1000 : 0;
+  s.pcHeartbeatAlive = s.pcHeartbeatSeen &&
+                       (nowUs - lastPcHeartbeatUs) <= CAN_WATCHDOG_TIMEOUT_US;
 
-  if (!measurement.valid) {
-    printSteadyWaveform(digitalRead(inputPin) == HIGH);
-    Serial.println();
-    return;
-  }
-
-  printPulseWaveform(measurement);
-  Serial.println();
-}
-
-void printPulseMeasurement(const char *name, uint8_t inputPin, const PulseMeasurement &measurement) {
-  Serial.printf("%-4s | IN  %2u | ", name, inputPin);
-
-  if (!measurement.valid) {
-    const bool steadyHigh = digitalRead(inputPin) == HIGH;
-    Serial.printf("%-12s | %-14s | %-10s | %-12s",
-                  steadyHigh ? "steady HIGH" : "steady LOW",
-                  "-",
-                  "-",
-                  "-");
-    Serial.println();
-    return;
-  }
-
-  const float frequencyHz = 1000000.0f / measurement.periodUs;
-  const float dutyPercent = measurement.highUs * 100.0f / measurement.periodUs;
-
-  Serial.printf("high %4lu us | period %4lu us | %7.2f Hz | duty %6.2f%%",
-                (unsigned long)measurement.highUs,
-                (unsigned long)measurement.periodUs,
-                frequencyHz,
-                dutyPercent);
-  Serial.println();
+  return s;
 }
 
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
 
   analogReadResolution(ADC_RESOLUTION_BITS);
-  analogReadAveraging(16);
+  analogReadAveraging(ADC_AVERAGING_SAMPLES);
   analogWriteResolution(PWM_RESOLUTION_BITS);
 
   pinMode(POT_1_PIN, INPUT);
@@ -300,8 +245,7 @@ void loop() {
   readCanCommands();
   sendTeensyHeartbeat();
 
-  if (canCommandCount > 0 &&
-      pwmEnabled &&
+  if (pwmEnabled &&
       (lastPcHeartbeatUs == 0 || (micros() - lastPcHeartbeatUs) > CAN_WATCHDOG_TIMEOUT_US)) {
     pwmEnabled = false;
     canWatchdogTriggered = true;
@@ -321,72 +265,11 @@ void loop() {
   const PulseMeasurement pwm1Measurement = readPulseMeasurement(pwm1Capture);
   const PulseMeasurement pwm2Measurement = readPulseMeasurement(pwm2Capture);
 
-  Serial.print("\r\033[2J\033[H");
-  Serial.println("Teensy 4.1 Analog Input -> 800 Hz PWM Monitor");
-  Serial.println("A0(pin 14) -> PWM pin 2, A1(pin 15) -> PWM pin 3");
-  Serial.println("Jumper for measurement: PWM pin 2 -> input pin 4, PWM pin 3 -> input pin 5");
-  Serial.println("CAN1: pin 22 TX -> WCMCU-230 CTX, pin 23 RX -> WCMCU-230 CRX");
-  Serial.printf("ADC range = 0 ~ %d, PWM range = 0 ~ %d, PWM frequency = %.0f Hz\r\n",
-                ADC_MAX_VALUE,
-                PWM_MAX_VALUE,
-                PWM_FREQUENCY_HZ);
-  Serial.println();
-  Serial.println("CAN CONTROL");
-  Serial.printf("ID 0x%03lX | bitrate %lu bps | protocol: data[0] 0x00=OFF, 0x01=ON, 0x02=TOGGLE\r\n",
-                (unsigned long)CAN_CONTROL_ID,
-                (unsigned long)CAN_BAUD_RATE);
-  Serial.printf("Heartbeat: PC -> 0x%03lX#%02X, Teensy -> 0x%03lX#%02X every %lu ms\r\n",
-                (unsigned long)PC_HEARTBEAT_ID,
-                HEARTBEAT_MAGIC,
-                (unsigned long)TEENSY_HEARTBEAT_ID,
-                HEARTBEAT_MAGIC,
-                (unsigned long)(HEARTBEAT_TX_INTERVAL_US / 1000));
-  Serial.printf("PWM output: %-3s | last command: %-7s | valid rx: %lu | invalid rx: %lu\r\n",
-                pwmEnabled ? "ON" : "OFF",
-                canCommandCount == 0 ? "-" : canCommandName(lastCanCommand),
-                (unsigned long)canCommandCount,
-                (unsigned long)canInvalidCommandCount);
-  Serial.printf("Watchdog: %s (timeout %lu ms)\r\n",
-                canWatchdogTriggered ? "TRIPPED -> forced OFF" : "ok",
-                (unsigned long)(CAN_WATCHDOG_TIMEOUT_US / 1000));
-  Serial.printf("Heartbeat rx: %lu | tx: %lu | PC heartbeat age: ",
-                (unsigned long)pcHeartbeatCount,
-                (unsigned long)teensyHeartbeatCount);
-  if (lastPcHeartbeatUs == 0) {
-    Serial.println("none");
-  } else {
-    Serial.printf("%lu ms\r\n", (unsigned long)((micros() - lastPcHeartbeatUs) / 1000));
-  }
-  Serial.printf("Last valid command age: ");
-  if (canCommandCount == 0) {
-    Serial.println("none");
-  } else {
-    Serial.printf("%lu ms\r\n", (unsigned long)((micros() - lastCanCommandUs) / 1000));
-  }
-  Serial.println();
-  Serial.println("PWM OUTPUT");
-  Serial.println("IN   | OUT   | ADC      | VOLTAGE | DUTY       | LEVEL");
-  Serial.println("-----+-------+----------+---------+------------+--------------------------------");
-  printChannelValue("A0", PWM_1_PIN, pot1Raw, pwm1OutputValue);
-  printChannelValue("A1", PWM_2_PIN, pot2Raw, pwm2OutputValue);
-  Serial.println("-----+-------+----------+---------+------------+--------------------------------");
-  Serial.println();
-  Serial.println("MEASURED PWM");
-  Serial.printf("%-4s | %-6s | %-12s | %-14s | %-10s | %-12s\r\n",
-                "SRC",
-                "INPUT",
-                "HIGH",
-                "PERIOD",
-                "FREQ",
-                "DUTY");
-  Serial.println("-----+--------+--------------+----------------+------------+--------------");
-  printPulseMeasurement("PWM2", PWM_1_MEASURE_PIN, pwm1Measurement);
-  printPulseMeasurement("PWM3", PWM_2_MEASURE_PIN, pwm2Measurement);
-  Serial.println("-----+--------+--------------+----------------+------------+--------------");
-  Serial.println();
-  Serial.println("MEASURED WAVEFORM");
-  printMeasuredWaveform("PWM2", PWM_1_MEASURE_PIN, pwm1Measurement);
-  printMeasuredWaveform("PWM3", PWM_2_MEASURE_PIN, pwm2Measurement);
+  const DashboardState state = buildDashboardState(
+      pot1Raw, pot2Raw,
+      pwm1OutputValue, pwm2OutputValue,
+      pwm1Measurement, pwm2Measurement);
+  dashboard::render(state);
 
   delay(READ_INTERVAL_MS);
 }
