@@ -17,8 +17,11 @@ uint8_t lastCanCommand = CAN_CMD_OFF;
 bool canWatchdogTriggered = false;
 uint32_t lastPcHeartbeatUs = 0;
 uint32_t lastTeensyHeartbeatTxUs = 0;
+uint32_t lastPulseTelemetryTxUs = 0;
+uint32_t lastDashboardRenderMs = 0;
 uint32_t pcHeartbeatCount = 0;
 uint32_t teensyHeartbeatCount = 0;
+uint8_t pulseTelemetrySequence = 0;
 
 struct PulseCapture {
   volatile uint32_t lastRiseUs = 0;
@@ -83,6 +86,7 @@ void handleCanCommand(const CAN_message_t &message) {
 
   lastCanCommand = command;
   lastCanCommandUs = micros();
+  lastPcHeartbeatUs = lastCanCommandUs;
   canCommandCount++;
   canWatchdogTriggered = false;
 }
@@ -111,6 +115,56 @@ void sendTeensyHeartbeat() {
   Can1.write(message);
   lastTeensyHeartbeatTxUs = nowUs;
   teensyHeartbeatCount++;
+}
+
+uint16_t clampU16(uint32_t value) {
+  return value > 0xFFFFu ? 0xFFFFu : (uint16_t)value;
+}
+
+void putU16Le(uint8_t *buffer, uint8_t offset, uint16_t value) {
+  buffer[offset] = (uint8_t)(value & 0xFFu);
+  buffer[offset + 1] = (uint8_t)((value >> 8) & 0xFFu);
+}
+
+void sendPulseTelemetryFrame(uint32_t frameId,
+                             uint8_t sequence,
+                             int adcRaw,
+                             const PulseMeasurement &measurement,
+                             bool inputHigh) {
+  uint8_t flags = 0;
+  if (measurement.valid) flags |= 0x01;
+  if (inputHigh) flags |= 0x02;
+  if (pwmEnabled) flags |= 0x04;
+  if (canWatchdogTriggered) flags |= 0x08;
+
+  CAN_message_t message;
+  message.id = frameId;
+  message.flags.extended = 0;
+  message.flags.remote = 0;
+  message.len = 8;
+  message.buf[0] = sequence;
+  message.buf[1] = flags;
+  putU16Le(message.buf, 2, clampU16((uint32_t)adcRaw));
+  putU16Le(message.buf, 4, clampU16(measurement.highUs));
+  putU16Le(message.buf, 6, clampU16(measurement.periodUs));
+
+  Can1.write(message);
+}
+
+void sendPulseTelemetry(int pot1Raw, int pot2Raw,
+                        const PulseMeasurement &m1,
+                        const PulseMeasurement &m2) {
+  const uint32_t nowUs = micros();
+  if ((nowUs - lastPulseTelemetryTxUs) < PULSE_TELEMETRY_TX_INTERVAL_US) {
+    return;
+  }
+
+  const uint8_t sequence = pulseTelemetrySequence++;
+  sendPulseTelemetryFrame(PWM_1_TELEMETRY_ID, sequence, pot1Raw, m1,
+                          digitalRead(PWM_1_MEASURE_PIN) == HIGH);
+  sendPulseTelemetryFrame(PWM_2_TELEMETRY_ID, sequence, pot2Raw, m2,
+                          digitalRead(PWM_2_MEASURE_PIN) == HIGH);
+  lastPulseTelemetryTxUs = nowUs;
 }
 
 void updatePulseCapture(PulseCapture &capture, uint8_t pin) {
@@ -264,12 +318,15 @@ void loop() {
 
   const PulseMeasurement pwm1Measurement = readPulseMeasurement(pwm1Capture);
   const PulseMeasurement pwm2Measurement = readPulseMeasurement(pwm2Capture);
+  sendPulseTelemetry(pot1Raw, pot2Raw, pwm1Measurement, pwm2Measurement);
 
-  const DashboardState state = buildDashboardState(
-      pot1Raw, pot2Raw,
-      pwm1OutputValue, pwm2OutputValue,
-      pwm1Measurement, pwm2Measurement);
-  dashboard::render(state);
-
-  delay(READ_INTERVAL_MS);
+  const uint32_t nowMs = millis();
+  if ((nowMs - lastDashboardRenderMs) >= READ_INTERVAL_MS) {
+    const DashboardState state = buildDashboardState(
+        pot1Raw, pot2Raw,
+        pwm1OutputValue, pwm2OutputValue,
+        pwm1Measurement, pwm2Measurement);
+    dashboard::render(state);
+    lastDashboardRenderMs = nowMs;
+  }
 }
