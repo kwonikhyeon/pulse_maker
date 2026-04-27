@@ -11,9 +11,12 @@ const uint8_t STATUS_LED_PIN = LED_BUILTIN;
 
 const uint32_t CAN_BAUD_RATE = 500000;
 const uint32_t CAN_CONTROL_ID = 0x600;
+const uint32_t PC_HEARTBEAT_ID = 0x610;
+const uint32_t TEENSY_HEARTBEAT_ID = 0x611;
 const uint8_t CAN_CMD_OFF = 0x00;
 const uint8_t CAN_CMD_ON = 0x01;
 const uint8_t CAN_CMD_TOGGLE = 0x02;
+const uint8_t HEARTBEAT_MAGIC = 0xA5;
 
 const float ADC_REFERENCE_VOLTAGE = 3.3f;
 const int ADC_RESOLUTION_BITS = 12;
@@ -24,16 +27,23 @@ const float PWM_FREQUENCY_HZ = 800.0f;
 
 const unsigned long SERIAL_BAUD_RATE = 115200;
 const unsigned long READ_INTERVAL_MS = 200;
-const uint32_t PULSE_TIMEOUT_US = 100000;
+const uint32_t PULSE_TIMEOUT_US = 10000;
+const uint32_t CAN_WATCHDOG_TIMEOUT_US = 5000000;
+const uint32_t HEARTBEAT_TX_INTERVAL_US = 1000000;
 const int BAR_WIDTH = 30;
 const int WAVEFORM_WIDTH = 40;
 
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
-bool pwmEnabled = false;
+volatile bool pwmEnabled = false;
 uint32_t lastCanCommandUs = 0;
 uint32_t canCommandCount = 0;
 uint32_t canInvalidCommandCount = 0;
 uint8_t lastCanCommand = CAN_CMD_OFF;
+bool canWatchdogTriggered = false;
+uint32_t lastPcHeartbeatUs = 0;
+uint32_t lastTeensyHeartbeatTxUs = 0;
+uint32_t pcHeartbeatCount = 0;
+uint32_t teensyHeartbeatCount = 0;
 
 struct PulseCapture {
   volatile uint32_t lastRiseUs = 0;
@@ -41,6 +51,7 @@ struct PulseCapture {
   volatile uint32_t highUs = 0;
   volatile uint32_t periodUs = 0;
   volatile bool hasMeasurement = false;
+  volatile bool seenRise = false;
 };
 
 struct PulseMeasurement {
@@ -66,7 +77,21 @@ const char *canCommandName(uint8_t command) {
 }
 
 void handleCanCommand(const CAN_message_t &message) {
-  if (message.id != CAN_CONTROL_ID || message.flags.extended || message.len < 1) {
+  if (message.flags.extended ||
+      message.flags.remote ||
+      message.len < 1) {
+    return;
+  }
+
+  if (message.id == PC_HEARTBEAT_ID) {
+    if (message.buf[0] == HEARTBEAT_MAGIC) {
+      lastPcHeartbeatUs = micros();
+      pcHeartbeatCount++;
+    }
+    return;
+  }
+
+  if (message.id != CAN_CONTROL_ID) {
     return;
   }
 
@@ -90,6 +115,7 @@ void handleCanCommand(const CAN_message_t &message) {
   lastCanCommand = command;
   lastCanCommandUs = micros();
   canCommandCount++;
+  canWatchdogTriggered = false;
 }
 
 void readCanCommands() {
@@ -100,17 +126,36 @@ void readCanCommands() {
   }
 }
 
+void sendTeensyHeartbeat() {
+  const uint32_t nowUs = micros();
+  if ((nowUs - lastTeensyHeartbeatTxUs) < HEARTBEAT_TX_INTERVAL_US) {
+    return;
+  }
+
+  CAN_message_t message;
+  message.id = TEENSY_HEARTBEAT_ID;
+  message.flags.extended = 0;
+  message.flags.remote = 0;
+  message.len = 1;
+  message.buf[0] = HEARTBEAT_MAGIC;
+
+  Can1.write(message);
+  lastTeensyHeartbeatTxUs = nowUs;
+  teensyHeartbeatCount++;
+}
+
 void updatePulseCapture(PulseCapture &capture, uint8_t pin) {
   const uint32_t nowUs = micros();
   capture.lastEdgeUs = nowUs;
 
   if (digitalRead(pin) == HIGH) {
-    if (capture.lastRiseUs != 0) {
+    if (capture.seenRise) {
       capture.periodUs = nowUs - capture.lastRiseUs;
       capture.hasMeasurement = true;
     }
     capture.lastRiseUs = nowUs;
-  } else {
+    capture.seenRise = true;
+  } else if (capture.seenRise) {
     capture.highUs = nowUs - capture.lastRiseUs;
   }
 }
@@ -161,7 +206,7 @@ void printSteadyWaveform(bool high) {
 
 void printPulseWaveform(const PulseMeasurement &measurement) {
   int highWidth = (measurement.highUs * WAVEFORM_WIDTH + measurement.periodUs / 2) / measurement.periodUs;
-  highWidth = constrain(highWidth, 1, WAVEFORM_WIDTH - 1);
+  highWidth = constrain(highWidth, 0, WAVEFORM_WIDTH);
 
   Serial.print("|");
   for (int i = 0; i < highWidth; i++) {
@@ -218,8 +263,8 @@ void printPulseMeasurement(const char *name, uint8_t inputPin, const PulseMeasur
   const float dutyPercent = measurement.highUs * 100.0f / measurement.periodUs;
 
   Serial.printf("high %4lu us | period %4lu us | %7.2f Hz | duty %6.2f%%",
-                measurement.highUs,
-                measurement.periodUs,
+                (unsigned long)measurement.highUs,
+                (unsigned long)measurement.periodUs,
                 frequencyHz,
                 dutyPercent);
   Serial.println();
@@ -253,6 +298,14 @@ void setup() {
 
 void loop() {
   readCanCommands();
+  sendTeensyHeartbeat();
+
+  if (canCommandCount > 0 &&
+      pwmEnabled &&
+      (lastPcHeartbeatUs == 0 || (micros() - lastPcHeartbeatUs) > CAN_WATCHDOG_TIMEOUT_US)) {
+    pwmEnabled = false;
+    canWatchdogTriggered = true;
+  }
 
   const int pot1Raw = analogRead(POT_1_PIN);
   const int pot2Raw = analogRead(POT_2_PIN);
@@ -280,18 +333,35 @@ void loop() {
   Serial.println();
   Serial.println("CAN CONTROL");
   Serial.printf("ID 0x%03lX | bitrate %lu bps | protocol: data[0] 0x00=OFF, 0x01=ON, 0x02=TOGGLE\r\n",
-                CAN_CONTROL_ID,
-                CAN_BAUD_RATE);
+                (unsigned long)CAN_CONTROL_ID,
+                (unsigned long)CAN_BAUD_RATE);
+  Serial.printf("Heartbeat: PC -> 0x%03lX#%02X, Teensy -> 0x%03lX#%02X every %lu ms\r\n",
+                (unsigned long)PC_HEARTBEAT_ID,
+                HEARTBEAT_MAGIC,
+                (unsigned long)TEENSY_HEARTBEAT_ID,
+                HEARTBEAT_MAGIC,
+                (unsigned long)(HEARTBEAT_TX_INTERVAL_US / 1000));
   Serial.printf("PWM output: %-3s | last command: %-7s | valid rx: %lu | invalid rx: %lu\r\n",
                 pwmEnabled ? "ON" : "OFF",
-                canCommandName(lastCanCommand),
-                canCommandCount,
-                canInvalidCommandCount);
+                canCommandCount == 0 ? "-" : canCommandName(lastCanCommand),
+                (unsigned long)canCommandCount,
+                (unsigned long)canInvalidCommandCount);
+  Serial.printf("Watchdog: %s (timeout %lu ms)\r\n",
+                canWatchdogTriggered ? "TRIPPED -> forced OFF" : "ok",
+                (unsigned long)(CAN_WATCHDOG_TIMEOUT_US / 1000));
+  Serial.printf("Heartbeat rx: %lu | tx: %lu | PC heartbeat age: ",
+                (unsigned long)pcHeartbeatCount,
+                (unsigned long)teensyHeartbeatCount);
+  if (lastPcHeartbeatUs == 0) {
+    Serial.println("none");
+  } else {
+    Serial.printf("%lu ms\r\n", (unsigned long)((micros() - lastPcHeartbeatUs) / 1000));
+  }
   Serial.printf("Last valid command age: ");
   if (canCommandCount == 0) {
     Serial.println("none");
   } else {
-    Serial.printf("%lu ms\r\n", (micros() - lastCanCommandUs) / 1000);
+    Serial.printf("%lu ms\r\n", (unsigned long)((micros() - lastCanCommandUs) / 1000));
   }
   Serial.println();
   Serial.println("PWM OUTPUT");
