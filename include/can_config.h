@@ -13,6 +13,11 @@ constexpr uint32_t PWM_2_TELEMETRY_ID = 0x622;
 constexpr uint8_t CAN_CMD_OFF = 0x00;
 constexpr uint8_t CAN_CMD_ON = 0x01;
 constexpr uint8_t CAN_CMD_TOGGLE = 0x02;
+constexpr uint8_t CAN_CMD_SET_DUTY = 0x10;
+
+constexpr uint8_t CAN_DUTY_CHANNEL_1 = 0x01;
+constexpr uint8_t CAN_DUTY_CHANNEL_2 = 0x02;
+constexpr uint8_t CAN_DUTY_CHANNEL_ALL = CAN_DUTY_CHANNEL_1 | CAN_DUTY_CHANNEL_2;
 
 constexpr uint8_t HEARTBEAT_MAGIC = 0xA5;
 

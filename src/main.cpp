@@ -22,6 +22,10 @@ uint32_t lastDashboardRenderMs = 0;
 uint32_t pcHeartbeatCount = 0;
 uint32_t teensyHeartbeatCount = 0;
 uint8_t pulseTelemetrySequence = 0;
+float lastPwm1FrequencyHz = 0.0f;
+float lastPwm2FrequencyHz = 0.0f;
+uint16_t pwm1DutyValue = PWM_DEFAULT_DUTY_VALUE;
+uint16_t pwm2DutyValue = PWM_DEFAULT_DUTY_VALUE;
 
 struct PulseCapture {
   volatile uint32_t lastRiseUs = 0;
@@ -43,9 +47,41 @@ const char *canCommandName(uint8_t command) {
       return "ON";
     case CAN_CMD_TOGGLE:
       return "TOGGLE";
+    case CAN_CMD_SET_DUTY:
+      return "SET_DUTY";
     default:
       return "UNKNOWN";
   }
+}
+
+uint16_t getU16Le(const uint8_t *buffer, uint8_t offset) {
+  return (uint16_t)buffer[offset] | ((uint16_t)buffer[offset + 1] << 8);
+}
+
+bool applyCanDutyCommand(const CAN_message_t &message) {
+  if (message.len < 4) {
+    return false;
+  }
+
+  const uint8_t channelMask = message.buf[1];
+  if ((channelMask & CAN_DUTY_CHANNEL_ALL) == 0 ||
+      (channelMask & ~CAN_DUTY_CHANNEL_ALL) != 0) {
+    return false;
+  }
+
+  uint16_t dutyValue = getU16Le(message.buf, 2);
+  if (dutyValue > PWM_MAX_VALUE) {
+    dutyValue = PWM_MAX_VALUE;
+  }
+
+  if ((channelMask & CAN_DUTY_CHANNEL_1) != 0) {
+    pwm1DutyValue = dutyValue;
+  }
+  if ((channelMask & CAN_DUTY_CHANNEL_2) != 0) {
+    pwm2DutyValue = dutyValue;
+  }
+
+  return true;
 }
 
 void handleCanCommand(const CAN_message_t &message) {
@@ -79,6 +115,12 @@ void handleCanCommand(const CAN_message_t &message) {
     case CAN_CMD_TOGGLE:
       pwmEnabled = !pwmEnabled;
       break;
+    case CAN_CMD_SET_DUTY:
+      if (!applyCanDutyCommand(message)) {
+        canInvalidCommandCount++;
+        return;
+      }
+      break;
     default:
       canInvalidCommandCount++;
       return;
@@ -96,6 +138,28 @@ void readCanCommands() {
 
   while (Can1.read(message)) {
     handleCanCommand(message);
+  }
+}
+
+float mapAdcToFrequencyHz(int adcRaw) {
+  if (adcRaw < 0) {
+    adcRaw = 0;
+  } else if (adcRaw > ADC_MAX_VALUE) {
+    adcRaw = ADC_MAX_VALUE;
+  }
+
+  return PWM_MIN_FREQUENCY_HZ +
+         (float)adcRaw * (PWM_MAX_FREQUENCY_HZ - PWM_MIN_FREQUENCY_HZ) /
+             (float)ADC_MAX_VALUE;
+}
+
+void updatePwmFrequency(uint8_t pin, float frequencyHz, float &lastFrequencyHz) {
+  const float delta = frequencyHz > lastFrequencyHz
+                          ? frequencyHz - lastFrequencyHz
+                          : lastFrequencyHz - frequencyHz;
+  if (lastFrequencyHz == 0.0f || delta >= 1.0f) {
+    analogWriteFrequency(pin, frequencyHz);
+    lastFrequencyHz = frequencyHz;
   }
 }
 
@@ -128,7 +192,7 @@ void putU16Le(uint8_t *buffer, uint8_t offset, uint16_t value) {
 
 void sendPulseTelemetryFrame(uint32_t frameId,
                              uint8_t sequence,
-                             int adcRaw,
+                             float commandedFrequencyHz,
                              const PulseMeasurement &measurement,
                              bool inputHigh) {
   uint8_t flags = 0;
@@ -144,14 +208,14 @@ void sendPulseTelemetryFrame(uint32_t frameId,
   message.len = 8;
   message.buf[0] = sequence;
   message.buf[1] = flags;
-  putU16Le(message.buf, 2, clampU16((uint32_t)adcRaw));
+  putU16Le(message.buf, 2, clampU16((uint32_t)(commandedFrequencyHz + 0.5f)));
   putU16Le(message.buf, 4, clampU16(measurement.highUs));
   putU16Le(message.buf, 6, clampU16(measurement.periodUs));
 
   Can1.write(message);
 }
 
-void sendPulseTelemetry(int pot1Raw, int pot2Raw,
+void sendPulseTelemetry(float pwm1FrequencyHz, float pwm2FrequencyHz,
                         const PulseMeasurement &m1,
                         const PulseMeasurement &m2) {
   const uint32_t nowUs = micros();
@@ -160,9 +224,9 @@ void sendPulseTelemetry(int pot1Raw, int pot2Raw,
   }
 
   const uint8_t sequence = pulseTelemetrySequence++;
-  sendPulseTelemetryFrame(PWM_1_TELEMETRY_ID, sequence, pot1Raw, m1,
+  sendPulseTelemetryFrame(PWM_1_TELEMETRY_ID, sequence, pwm1FrequencyHz, m1,
                           digitalRead(PWM_1_MEASURE_PIN) == HIGH);
-  sendPulseTelemetryFrame(PWM_2_TELEMETRY_ID, sequence, pot2Raw, m2,
+  sendPulseTelemetryFrame(PWM_2_TELEMETRY_ID, sequence, pwm2FrequencyHz, m2,
                           digitalRead(PWM_2_MEASURE_PIN) == HIGH);
   lastPulseTelemetryTxUs = nowUs;
 }
@@ -213,6 +277,8 @@ DashboardChannel buildChannel(const char *label,
                               uint8_t pwmPin,
                               uint8_t measurePin,
                               int adcRaw,
+                              float commandedFrequencyHz,
+                              uint16_t commandedDutyValue,
                               int pwmOutput,
                               const PulseMeasurement &measurement) {
   DashboardChannel ch{};
@@ -222,15 +288,19 @@ DashboardChannel buildChannel(const char *label,
   ch.adcRaw = adcRaw;
   ch.adcMax = ADC_MAX_VALUE;
   ch.voltage = adcRaw * ADC_REFERENCE_VOLTAGE / ADC_MAX_VALUE;
+  ch.commandedFrequencyHz = commandedFrequencyHz;
+  ch.minFrequencyHz = PWM_MIN_FREQUENCY_HZ;
+  ch.maxFrequencyHz = PWM_MAX_FREQUENCY_HZ;
   ch.pwmOutput = pwmOutput;
   ch.pwmMax = PWM_MAX_VALUE;
-  ch.commandedDutyPercent = pwmOutput * 100.0f / PWM_MAX_VALUE;
+  ch.commandedDutyPercent = commandedDutyValue * 100.0f / PWM_MAX_VALUE;
   ch.measurement = measurement;
   ch.inputHigh = digitalRead(measurePin) == HIGH;
   return ch;
 }
 
 DashboardState buildDashboardState(int pot1Raw, int pot2Raw,
+                                   float pwm1FrequencyHz, float pwm2FrequencyHz,
                                    int pwm1OutputValue, int pwm2OutputValue,
                                    const PulseMeasurement &m1,
                                    const PulseMeasurement &m2) {
@@ -238,10 +308,11 @@ DashboardState buildDashboardState(int pot1Raw, int pot2Raw,
   DashboardState s{};
   s.uptimeMs = millis();
   s.pwmEnabled = pwmEnabled;
-  s.pwmFrequencyHz = PWM_FREQUENCY_HZ;
 
-  s.ch1 = buildChannel("A0", PWM_1_PIN, PWM_1_MEASURE_PIN, pot1Raw, pwm1OutputValue, m1);
-  s.ch2 = buildChannel("A1", PWM_2_PIN, PWM_2_MEASURE_PIN, pot2Raw, pwm2OutputValue, m2);
+  s.ch1 = buildChannel("A0", PWM_1_PIN, PWM_1_MEASURE_PIN, pot1Raw,
+                       pwm1FrequencyHz, pwm1DutyValue, pwm1OutputValue, m1);
+  s.ch2 = buildChannel("A1", PWM_2_PIN, PWM_2_MEASURE_PIN, pot2Raw,
+                       pwm2FrequencyHz, pwm2DutyValue, pwm2OutputValue, m2);
 
   s.canControlId = CAN_CONTROL_ID;
   s.canBaudRate = CAN_BAUD_RATE;
@@ -285,8 +356,8 @@ void setup() {
   pinMode(STATUS_LED_PIN, OUTPUT);
   digitalWrite(STATUS_LED_PIN, LOW);
 
-  analogWriteFrequency(PWM_1_PIN, PWM_FREQUENCY_HZ);
-  analogWriteFrequency(PWM_2_PIN, PWM_FREQUENCY_HZ);
+  analogWriteFrequency(PWM_1_PIN, PWM_MIN_FREQUENCY_HZ);
+  analogWriteFrequency(PWM_2_PIN, PWM_MIN_FREQUENCY_HZ);
 
   Can1.begin();
   Can1.setBaudRate(CAN_BAUD_RATE);
@@ -307,10 +378,13 @@ void loop() {
 
   const int pot1Raw = analogRead(POT_1_PIN);
   const int pot2Raw = analogRead(POT_2_PIN);
-  const int pwm1CommandValue = map(pot1Raw, 0, ADC_MAX_VALUE, 0, PWM_MAX_VALUE);
-  const int pwm2CommandValue = map(pot2Raw, 0, ADC_MAX_VALUE, 0, PWM_MAX_VALUE);
-  const int pwm1OutputValue = pwmEnabled ? pwm1CommandValue : 0;
-  const int pwm2OutputValue = pwmEnabled ? pwm2CommandValue : 0;
+  const float pwm1FrequencyHz = mapAdcToFrequencyHz(pot1Raw);
+  const float pwm2FrequencyHz = mapAdcToFrequencyHz(pot2Raw);
+  updatePwmFrequency(PWM_1_PIN, pwm1FrequencyHz, lastPwm1FrequencyHz);
+  updatePwmFrequency(PWM_2_PIN, pwm2FrequencyHz, lastPwm2FrequencyHz);
+
+  const int pwm1OutputValue = pwmEnabled ? pwm1DutyValue : 0;
+  const int pwm2OutputValue = pwmEnabled ? pwm2DutyValue : 0;
 
   analogWrite(PWM_1_PIN, pwm1OutputValue);
   analogWrite(PWM_2_PIN, pwm2OutputValue);
@@ -318,12 +392,13 @@ void loop() {
 
   const PulseMeasurement pwm1Measurement = readPulseMeasurement(pwm1Capture);
   const PulseMeasurement pwm2Measurement = readPulseMeasurement(pwm2Capture);
-  sendPulseTelemetry(pot1Raw, pot2Raw, pwm1Measurement, pwm2Measurement);
+  sendPulseTelemetry(pwm1FrequencyHz, pwm2FrequencyHz, pwm1Measurement, pwm2Measurement);
 
   const uint32_t nowMs = millis();
   if ((nowMs - lastDashboardRenderMs) >= READ_INTERVAL_MS) {
     const DashboardState state = buildDashboardState(
         pot1Raw, pot2Raw,
+        pwm1FrequencyHz, pwm2FrequencyHz,
         pwm1OutputValue, pwm2OutputValue,
         pwm1Measurement, pwm2Measurement);
     dashboard::render(state);

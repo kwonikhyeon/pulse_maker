@@ -15,6 +15,9 @@ struct DashboardChannel {
   int adcRaw;
   int adcMax;
   float voltage;
+  float commandedFrequencyHz;
+  float minFrequencyHz;
+  float maxFrequencyHz;
   int pwmOutput;
   int pwmMax;
   float commandedDutyPercent;
@@ -25,7 +28,6 @@ struct DashboardChannel {
 struct DashboardState {
   uint32_t uptimeMs;
   bool pwmEnabled;
-  float pwmFrequencyHz;
 
   DashboardChannel ch1;
   DashboardChannel ch2;

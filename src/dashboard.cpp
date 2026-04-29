@@ -39,8 +39,9 @@ void formatUptime(char *buf, size_t bufLen, uint32_t ms) {
            (unsigned long)h, (unsigned long)m, (unsigned long)s);
 }
 
-void renderBar(int value, int maxValue, int width) {
-  int filled = (value * width + maxValue / 2) / maxValue;
+void renderFrequencyBar(float value, float minValue, float maxValue, int width) {
+  const float span = maxValue - minValue;
+  int filled = span > 0.0f ? (int)(((value - minValue) * width / span) + 0.5f) : 0;
   if (filled < 0) filled = 0;
   if (filled > width) filled = width;
 
@@ -72,17 +73,17 @@ void renderHeartbeatTag(bool seen, bool alive) {
   else            Serial.print("\033[31m  lost \033[0m");
 }
 
-void renderDutyError(float commanded, float measured, bool measurementValid) {
+void renderFrequencyError(float commanded, float measured, bool measurementValid) {
   if (!measurementValid) {
     Serial.print("\033[90m( ----- )\033[0m");
     return;
   }
   const float err = measured - commanded;
   const float absErr = fabsf(err);
-  if (absErr > 2.0f)      Serial.print("\033[31m");
-  else if (absErr > 0.5f) Serial.print("\033[33m");
+  if (absErr > 15.0f)      Serial.print("\033[31m");
+  else if (absErr > 5.0f)  Serial.print("\033[33m");
   else                    Serial.print("\033[32m");
-  Serial.printf("(%+6.2f%%)", err);
+  Serial.printf("(%+6.1fHz)", err);
   resetStyle();
 }
 
@@ -152,25 +153,27 @@ void renderHeartbeatRow(const DashboardState &s) {
 
 void renderCommandedHeader(const DashboardState &s) {
   rowStart();
-  Serial.printf("  \033[1mPWM OUTPUT\033[0m  (commanded, %.0f Hz)", s.pwmFrequencyHz);
+  (void)s;
+  Serial.print("  \033[1mPWM OUTPUT\033[0m  (ADC frequency, CAN duty command)");
   rowEnd();
 }
 
 void renderCommandedRow(const DashboardChannel &ch) {
   rowStart();
-  Serial.printf("   %-2s -> PWM%-2u   ADC %4d (%4.2f V)   duty %6.2f %%   ",
+  Serial.printf("   %-2s PWM%-2u  ADC %4d %4.2fV  %4.0fHz  duty %5.1f%%  ",
                 ch.label,
                 (unsigned)ch.pwmPin,
                 ch.adcRaw,
                 ch.voltage,
+                ch.commandedFrequencyHz,
                 ch.commandedDutyPercent);
-  renderBar(ch.pwmOutput, ch.pwmMax, BAR_WIDTH);
+  renderFrequencyBar(ch.commandedFrequencyHz, ch.minFrequencyHz, ch.maxFrequencyHz, BAR_WIDTH);
   rowEnd();
 }
 
 void renderMeasuredHeader() {
   rowStart();
-  Serial.print("  \033[1mPWM MEASURED\033[0m  (jumper feedback, delta vs commanded)");
+  Serial.print("  \033[1mPWM MEASURED\033[0m  (jumper feedback, frequency delta)");
   rowEnd();
 }
 
@@ -186,13 +189,12 @@ void renderMeasuredRow(const DashboardChannel &ch) {
   const float frequencyHz = 1000000.0f / (float)ch.measurement.periodUs;
   const float measuredDuty = (float)ch.measurement.highUs * 100.0f /
                              (float)ch.measurement.periodUs;
-  Serial.printf("   PWM%-2u  %7.2f Hz  high %4lu us  period %4lu us  duty %5.2f%% ",
+  Serial.printf("   PWM%-2u  %7.2f Hz  period %4lu us  duty %5.2f%%  ",
                 (unsigned)ch.measurePin,
                 frequencyHz,
-                (unsigned long)ch.measurement.highUs,
                 (unsigned long)ch.measurement.periodUs,
                 measuredDuty);
-  renderDutyError(ch.commandedDutyPercent, measuredDuty, true);
+  renderFrequencyError(ch.commandedFrequencyHz, frequencyHz, true);
   rowEnd();
 }
 
